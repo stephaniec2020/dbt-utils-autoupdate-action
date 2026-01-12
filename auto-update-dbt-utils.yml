@@ -1,0 +1,142 @@
+name: Auto-update dbt_utils version
+
+on:
+  schedule:
+    # Run on Monday at 8:30 AM UTC
+    - cron: '30 08 * * 1'
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check-and-update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: develop # keep automation off main by always basing branches on develop, modify as needed
+          fetch-depth: 0
+
+      - name: Get latest dbt-utils version
+        id: latest-version
+        # Fetch latest release from GitHub API
+        run: |
+          LATEST_VERSION=$(curl -s https://api.github.com/repos/dbt-labs/dbt-utils/releases/latest | jq -r '.tag_name' | sed 's/^v//')
+          echo "version=$LATEST_VERSION" >> $GITHUB_OUTPUT
+          echo "Latest dbt-utils version: $LATEST_VERSION"
+
+      - name: Get current version from packages.yml
+        id: current-version
+        # Pulls version straight from YAML with awk, avoiding dbt CLI or packages-lock.yml
+        run: |
+          set -euo pipefail
+          PACKAGE_FILE="${GITHUB_WORKSPACE:-$(pwd)}/dbt/packages.yml"
+
+          CURRENT_VERSION=$(awk '
+            /dbt-labs\/dbt_utils/ {
+              if (getline line) {
+                if (match(line, /version:[[:space:]]*"?([^"[:space:]]+)"?/, arr)) {
+                  print arr[1]
+                  exit
+                }
+              }
+            }
+          ' "$PACKAGE_FILE")
+
+          if [ -z "$CURRENT_VERSION" ]; then
+            echo "Failed to locate dbt_utils version in $PACKAGE_FILE" >&2
+            exit 1
+          fi
+
+          echo "version=$CURRENT_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Current dbt-utils version: $CURRENT_VERSION"
+          
+      - name: Check if update needed
+        id: check-update
+        run: |
+          if [ "${{ steps.current-version.outputs.version }}" != "${{ steps.latest-version.outputs.version }}" ]; then
+            echo "update_needed=true" >> $GITHUB_OUTPUT
+            echo "Update needed: ${{ steps.current-version.outputs.version }} -> ${{ steps.latest-version.outputs.version }}"
+          else
+            echo "update_needed=false" >> $GITHUB_OUTPUT
+            echo "Already up to date"
+          fi
+
+      - name: Determine branch name
+        if: steps.check-update.outputs.update_needed == 'true'
+        # Deterministic branch naming means new runs can safely force-push the same ref
+        id: branch-name
+        run: |
+          BRANCH="auto-update-dbt-utils-${{ steps.latest-version.outputs.version }}"
+          echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "Branch name: $BRANCH"
+
+      - name: Update packages.yml
+        if: steps.check-update.outputs.update_needed == 'true'
+        # Uses awk-only rewrite to avoid extra tooling like yq; assumes simple YAML structure
+        run: |
+          set -euo pipefail
+          PACKAGE_FILE="${GITHUB_WORKSPACE:-$(pwd)}/dbt/packages.yml"
+          TMP_FILE=$(mktemp)
+          trap 'rm -f "$TMP_FILE"' EXIT
+
+          awk -v new_version='${{ steps.latest-version.outputs.version }}' -v out="$TMP_FILE" '
+            BEGIN {updated=0}
+            /dbt-labs\/dbt_utils/ {
+              print >> out
+              if (getline line) {
+                if (line ~ /version:/) {
+                  sub(/version:[[:space:]]*"?[^"[:space:]]+"?/, "version: " new_version, line)
+                  updated=1
+                }
+                print line >> out
+              }
+              next
+            }
+            {print >> out}
+            END {
+              close(out)
+              if (!updated) {
+                print "dbt_utils package entry not found in packages.yml" > "/dev/stderr"
+                exit 1
+              }
+            }
+          ' "$PACKAGE_FILE"
+
+          mv "$TMP_FILE" "$PACKAGE_FILE"
+          trap - EXIT
+          cat "$PACKAGE_FILE"
+
+      - name: Commit and push branch
+        if: steps.check-update.outputs.update_needed == 'true'
+        # Force-push ensures the reusable branch always reflects the latest automation run
+        run: |
+          set -euo pipefail
+          BRANCH="${{ steps.branch-name.outputs.name }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add dbt/packages.yml
+          git commit -m "chore: update dbt_utils from ${{ steps.current-version.outputs.version }} to ${{ steps.latest-version.outputs.version }}"
+          git push --force origin "$BRANCH"
+
+
+      - name: Report branch creation
+        if: steps.check-update.outputs.update_needed == 'true'
+        # Stops short of auto-PR creation so humans control review timing
+        run: |
+          BRANCH="${{ steps.branch-name.outputs.name }}"
+          cat <<EOF >> "$GITHUB_STEP_SUMMARY"
+          ## dbt_utils update branch created
+          - Branch: \`$BRANCH\`
+          - Base: \`develop\`
+          - Previous version: \`${{ steps.current-version.outputs.version }}\`
+          - New version: \`${{ steps.latest-version.outputs.version }}\`
+
+          Please open a pull request manually.
+          EOF
+          echo "Created branch $BRANCH"
+        
