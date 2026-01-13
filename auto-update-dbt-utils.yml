@@ -70,7 +70,7 @@ jobs:
         # Deterministic branch naming means new runs can safely force-push the same ref
         id: branch-name
         run: |
-          BRANCH="auto-update-dbt-utils-${{ steps.latest-version.outputs.version }}"
+          BRANCH="auto-update-dbt-utils"
           echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
           echo "Branch name: $BRANCH"
 
